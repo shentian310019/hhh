@@ -171,11 +171,30 @@ candidate_vars <- candidate_vars %>%
 #------------------------------------------------------------
 
 run_cox_one <- function(label, data_var, group_label, data) {
+  if (!data_var %in% names(data)) {
+    message("变量 ", label, " 不存在，跳过")
+    return(NULL)
+  }
+
   # 尽量把暴露变量转为数值型，便于 scale()
   if (!is.numeric(data[[data_var]])) {
     suppressWarnings({
       data[[data_var]] <- as.numeric(as.character(data[[data_var]]))
     })
+  }
+
+  if (!is.numeric(data[[data_var]])) {
+    message("变量 ", label, " 类型不合法，无法转为数值，跳过")
+    return(NULL)
+  }
+
+  data_for_fit <- data %>%
+    select(time, hf_event, age, sex, race, all_of(data_var)) %>%
+    filter(!is.na(.data[[data_var]]))
+
+  if (nrow(data_for_fit) == 0 || all(is.na(data_for_fit[[data_var]]))) {
+    message("变量 ", label, " 全部缺失，跳过")
+    return(NULL)
   }
 
   # 构建公式：Surv(time, hf_event) ~ scale(biomarker) + age + sex + race
@@ -184,9 +203,9 @@ run_cox_one <- function(label, data_var, group_label, data) {
   )
 
   fit <- tryCatch(
-    survival::coxph(form, data = data),
+    survival::coxph(form, data = data_for_fit),
     error = function(e) {
-      message("Cox 错误: ", label, " | ", e$message)
+      message("Cox 拟合失败：", label, "，原因：", e$message)
       return(NULL)
     }
   )
@@ -213,7 +232,7 @@ run_cox_one <- function(label, data_var, group_label, data) {
     se       = ctab[1, "se(coef)"],
     z        = ctab[1, "z"],
     p        = ctab[1, "Pr(>|z|)"],
-    n        = nrow(data)
+    n        = nrow(data_for_fit)
   )
 }
 
@@ -236,6 +255,10 @@ res_list <- map2(
 
 res_list <- res_list[!vapply(res_list, is.null, logical(1))]
 res_df <- bind_rows(res_list)
+
+if (nrow(res_df) < 5) {
+  warning("成功拟合的变量少于 5 个，请检查输入数据和变量名。")
+}
 
 # 保存结果表
 out_dir <- file.path(project_root, "results", "nhanes_screening")
@@ -288,7 +311,85 @@ ggsave(
 )
 
 #------------------------------------------------------------
-# 7. 打印前 20 个变量
+# 7. 每个 group 选 1-2 个代表变量，绘制森林图
+#------------------------------------------------------------
+
+top_by_group <- res_df %>%
+  group_by(group) %>%
+  arrange(p, .by_group = TRUE) %>%
+  slice_head(n = 2) %>%
+  ungroup()
+
+forest_vars <- unique(top_by_group$data_var)
+
+if (length(forest_vars) == 0) {
+  message("没有可用于森林图的变量，跳过森林图绘制。")
+} else {
+  forest_formula <- as.formula(
+    paste(
+      "Surv(time, hf_event) ~",
+      paste(sprintf("scale(`%s`)", forest_vars), collapse = " + "),
+      "+ age + sex + race"
+    )
+  )
+
+  forest_data <- dat_t2d %>%
+    select(time, hf_event, age, sex, race, all_of(forest_vars)) %>%
+    tidyr::drop_na()
+
+  forest_fit <- tryCatch(
+    coxph(forest_formula, data = forest_data),
+    error = function(e) {
+      message("森林图的多变量 Cox 拟合失败：", e$message)
+      return(NULL)
+    }
+  )
+
+  if (!is.null(forest_fit)) {
+    forest_summary <- summary(forest_fit)
+    coef_df <- as.data.frame(forest_summary$coefficients)
+    ci_df   <- as.data.frame(forest_summary$conf.int)
+    coef_df$term <- rownames(coef_df)
+    ci_df$term   <- rownames(ci_df)
+
+    forest_res <- coef_df %>%
+      left_join(ci_df %>% select(term, `lower .95`, `upper .95`), by = "term") %>%
+      filter(str_detect(term, "^scale\\(")) %>%
+      mutate(
+        data_var = str_remove(term, "^scale\\((.*)\\)$"),
+        logHR    = coef,
+        HR       = exp(coef),
+        HR_low   = `lower .95`,
+        HR_high  = `upper .95`
+      ) %>%
+      left_join(top_by_group %>% select(var_name, data_var, group), by = "data_var")
+
+    forest_res <- forest_res %>%
+      mutate(var_display = fct_reorder(var_name, HR))
+
+    p_forest <- ggplot(forest_res, aes(x = HR, y = var_display, color = group)) +
+      geom_point(size = 2.5) +
+      geom_errorbarh(aes(xmin = HR_low, xmax = HR_high), height = 0.2) +
+      geom_vline(xintercept = 1, linetype = "dashed") +
+      scale_x_log10() +
+      labs(
+        x = "Hazard Ratio (log scale)",
+        y = NULL,
+        color = "Group",
+        title = "Representative axes for HF risk in T2D (NHANES)"
+      ) +
+      theme_bw(base_size = 12)
+
+    ggsave(
+      filename = file.path(out_dir, "forest_T2D_HF_main_axes.png"),
+      plot = p_forest,
+      width = 8, height = 6, dpi = 300
+    )
+  }
+}
+
+#------------------------------------------------------------
+# 8. 打印前 20 个变量
 #------------------------------------------------------------
 
 res_df %>%
